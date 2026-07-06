@@ -854,6 +854,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                         "user": user_text,
                         "assistant": assistant_text,
                         "session_id": session_id or self._session_id,
+                        # Correlation key for the session_end / pre_compress
+                        # safety nets — computed from the raw snapshot, the
+                        # same dicts _segment_turns hashes later.
+                        "turn_fp": _turn_fingerprint_from_messages(messages or []),
                     },
                 )
             )
@@ -1243,6 +1247,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             extra: Dict[str, Any] = {"source": "hermes"}
             if session_id:
                 extra["session_id"] = session_id
+            turn_fp = payload.get("turn_fp") or ""
+            if turn_fp:
+                extra["turn_fp"] = turn_fp
             file_conversation_exchange(
                 col,
                 wing=wing,
