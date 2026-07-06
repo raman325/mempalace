@@ -702,3 +702,88 @@ def test_match_wing_by_keywords_ignores_non_string_keywords(integration_module):
     wing_config = {"wing_dev": {"keywords": [None, 3, "python"]}}
     assert fn("write some python code", wing_config) == "wing_dev"
     assert fn("unrelated chatter", wing_config) == "wing_general"
+
+
+# ---------------------------------------------------------------------------
+# Review findings (PR #1915): duplicate filing, passthrough palace scoping,
+# on_memory_write default target, backup_paths().
+# ---------------------------------------------------------------------------
+
+
+def test_on_session_end_skips_turns_already_synced_live(initialized_provider):
+    """sync_turn() files turn 1 live; on_session_end's transcript replays it
+    plus one trailing turn sync_turn never saw. Only the trailing turn should
+    be filed again — replaying turn 1 would double-file it under a second
+    drawer id (make_exchange_drawer_id includes filed_at, so it isn't
+    idempotent)."""
+    initialized_provider.sync_turn("what's the plan?", "ship the PR")
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == 1
+
+    initialized_provider.on_session_end(
+        [
+            {"role": "user", "content": "what's the plan?"},
+            {"role": "assistant", "content": "ship the PR"},
+            {"role": "user", "content": "any blockers?"},
+            {"role": "assistant", "content": "none"},
+        ]
+    )
+    initialized_provider._worker_queue.join()
+
+    assert initialized_provider._collection.count() == 2
+
+
+def test_on_delegation_does_not_count_toward_session_end_skip(initialized_provider):
+    # Delegation turns are synthetic bookkeeping that never appears in the
+    # ``messages`` transcript on_session_end receives — counting them would
+    # skip (and lose) that many genuine leading turns instead.
+    initialized_provider.on_delegation("research X", "found Y", child_session_id="child-1")
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == 1
+    assert initialized_provider._synced_turns == 0
+
+    initialized_provider.on_session_end(
+        [
+            {"role": "user", "content": "what's the plan?"},
+            {"role": "assistant", "content": "ship the PR"},
+        ]
+    )
+    initialized_provider._worker_queue.join()
+
+    assert initialized_provider._collection.count() == 2
+
+
+def test_passthrough_tool_uses_provider_configured_palace_path(initialized_provider):
+    """mempalace_add_drawer must land in the provider's configured palace, not
+    mempalace's own global-config default palace (a different directory in
+    this fixture)."""
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_add_drawer",
+            {"wing": "wing_general", "room": "notes", "content": "hello from hermes"},
+        )
+    )
+    assert result.get("success", True) is not False
+    assert initialized_provider._collection.count() == 1
+
+
+def test_on_memory_write_mirrors_default_memory_target(initialized_provider):
+    # Hermes' memory tool omits ``target`` (defaults to "memory") on ordinary
+    # writes — those must be mirrored, not silently dropped.
+    initialized_provider.on_memory_write("add", "memory", "likes dark roast coffee")
+    initialized_provider._worker_queue.join()
+
+    db_path = str(Path(initialized_provider._palace_path).parent / "knowledge_graph.sqlite3")
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        relations = kg.query_entity("user")
+    finally:
+        kg.close()
+    assert any(r.get("object") == "likes dark roast coffee" for r in relations)
+
+
+def test_backup_paths_includes_palace_and_identity_roots(initialized_provider, palace_path):
+    roots = initialized_provider.backup_paths()
+    assert str(Path(palace_path).parent) in roots

@@ -71,6 +71,13 @@ except ImportError:  # pragma: no cover - Hermes not installed
 
 logger = logging.getLogger("mempalace.hermes")
 
+# ``mempalace.mcp_server`` resolves its palace path from ``MEMPALACE_PALACE_PATH``
+# / its own ``~/.mempalace/config.json`` — a process-global, not this provider's
+# ``self._palace_path``. Guards the env-var pin in ``_dispatch_mcp_passthrough``
+# so two provider instances (e.g. two Hermes profiles with different configured
+# palaces) can't race each other's passthrough calls.
+_PASSTHROUGH_ENV_LOCK = threading.Lock()
+
 
 def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
     """Return the first wing whose keywords match a whole word in ``text``.
@@ -499,6 +506,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._turn_count = 0
+        # Turns already filed live via sync_turn() this session. on_session_end
+        # receives the full transcript and would otherwise re-mine (and
+        # re-file, as a *new* drawer — filed_at makes ids non-idempotent) every
+        # turn sync_turn already persisted. Skipped in _mine_session below.
+        self._synced_turns = 0
+        self._synced_turns_lock = threading.Lock()
 
         # ChromaDB access through mempalace's own backend (matches embedding
         # function, fixes the dim-mismatch bug from prior PRs).
@@ -683,6 +696,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        _count_synced: bool = True,
     ) -> None:
         if self._cron_skipped or not self._initialized:
             return
@@ -701,6 +715,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                     },
                 )
             )
+            # Delegation turns (see on_delegation) are synthetic bookkeeping
+            # that never appears in the ``messages`` transcript on_session_end
+            # receives, so they must not count against the skip below.
+            if _count_synced:
+                with self._synced_turns_lock:
+                    self._synced_turns += 1
         except queue.Full:
             # Loud, not silent: the verbatim invariant is what mempalace sells.
             # If the queue saturates we want operators to see it.
@@ -721,11 +741,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # tasks that can never drain.
         if self._cron_skipped or not self._initialized:
             return
+        with self._synced_turns_lock:
+            already_synced, self._synced_turns = self._synced_turns, 0
         try:
             self._worker_queue.put_nowait(
                 (
                     "session_end",
-                    {"messages": list(messages or []), "session_id": self._session_id},
+                    {
+                        "messages": list(messages or []),
+                        "session_id": self._session_id,
+                        "already_synced": already_synced,
+                    },
                 )
             )
         except queue.Full:
@@ -754,6 +780,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id = new_session_id or ""
         if reset:
             self._turn_count = 0
+            with self._synced_turns_lock:
+                self._synced_turns = 0
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """File the messages about to be discarded and signal verbatim persistence.
@@ -795,7 +823,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._cron_skipped
             or not self._initialized  # worker isn't running; queueing leaks
             or action != "add"
-            or target != "user"
+            # Hermes' memory tool defaults ``target`` to "memory" when the
+            # caller omits it — that's the ordinary write path and must be
+            # mirrored, not just the explicit "user" target.
+            or target not in ("user", "memory")
             or not content
         ):
             return
@@ -823,6 +854,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             f"[delegated task]\n{task}",
             f"[subagent {child_session_id} returned]\n{result}",
             session_id=self._session_id,
+            _count_synced=False,
         )
 
     # ----- Tool dispatch ---------------------------------------------------
@@ -870,12 +902,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 return json.dumps(self._tool_diary_read(int(args.get("n", 10))))
 
             # Tools that delegate directly to ``mempalace.mcp_server``'s
-            # public ``tool_*`` entry points. These share mempalace's own
-            # config for palace_path resolution rather than this plugin's
-            # ``self._palace_path`` — a known asymmetry that the original
-            # eight tools above don't share. In the common case (default
-            # palace at ``~/.mempalace/palace``) both resolve to the same
-            # place.
+            # public ``tool_*`` entry points. ``_dispatch_mcp_passthrough``
+            # pins ``MEMPALACE_PALACE_PATH`` to ``self._palace_path`` for the
+            # duration of the call so these resolve against the same palace
+            # as the eight tools above rather than mempalace's own global
+            # config.
             # New tools (everything that has a matching ``tool_*`` in
             # mempalace.mcp_server) dispatch by name derivation. One
             # mempalace asymmetry to remap: ``mempalace_traverse`` maps to
@@ -946,7 +977,22 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # miner-ingested ones.
         if tool_name == "mempalace_add_drawer":
             args.setdefault("added_by", "hermes")
-        return json.dumps(func(**args))
+        # mempalace.mcp_server's tool_* functions resolve their palace from
+        # MEMPALACE_PALACE_PATH / ~/.mempalace/config.json — a process-global
+        # config, not this provider's self._palace_path. Pin the env var for
+        # the call so a Hermes profile with a custom palace_path doesn't read
+        # mempalace_search results from one palace and write drawers/tunnels
+        # via this passthrough to another.
+        with _PASSTHROUGH_ENV_LOCK:
+            prior = os.environ.get("MEMPALACE_PALACE_PATH")
+            os.environ["MEMPALACE_PALACE_PATH"] = self._palace_path
+            try:
+                return json.dumps(func(**args))
+            finally:
+                if prior is None:
+                    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+                else:
+                    os.environ["MEMPALACE_PALACE_PATH"] = prior
 
     # ----- Setup wizard integration ----------------------------------------
 
@@ -990,6 +1036,26 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         print("  1. mempalace init <your-project-dir>     # generates ~/.mempalace/")
         print("  2. (optional) edit ~/.mempalace/identity.txt to seed L0 wake-up context")
         print()
+
+    # ----- Backup integration -----------------------------------------------
+
+    def backup_paths(self) -> List[str]:
+        """Directories ``hermes backup`` should include beyond ``HERMES_HOME``.
+
+        MemPalace's actual state — the palace, diary, knowledge graph,
+        wing config — lives under ``~/.mempalace`` by default, outside
+        ``HERMES_HOME``, so ``hermes backup`` would silently miss it without
+        this.
+        """
+        roots: List[str] = []
+        if self._palace_path:
+            roots.append(str(Path(self._palace_path).parent))
+        identity_root = str(
+            Path(self._config.get("identity_path", self.DEFAULT_IDENTITY_PATH)).expanduser().parent
+        )
+        if identity_root not in roots:
+            roots.append(identity_root)
+        return [root for root in roots if Path(root).exists()]
 
     # ----- Shutdown --------------------------------------------------------
 
@@ -1107,9 +1173,19 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def _mine_session(self, payload: Dict[str, Any]) -> None:
         messages = payload.get("messages", []) or []
         session_id = payload.get("session_id", "") or ""
+        # Leading user turns already filed live by sync_turn() — re-mining them
+        # here would double-file the same exchange under a second, distinct
+        # drawer id (make_exchange_drawer_id includes filed_at). Only the tail
+        # sync_turn never got a chance to see (e.g. the last turn before the
+        # session boundary) needs mining.
+        already_synced = payload.get("already_synced", 0) or 0
+        skipped = 0
         try:
             for idx, msg in enumerate(messages):
                 if msg.get("role") != "user":
+                    continue
+                if skipped < already_synced:
+                    skipped += 1
                     continue
                 # Same content normalization ``sync_turn`` and ``pre_compress``
                 # use — list-shaped Anthropic content must not be persisted as
